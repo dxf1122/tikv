@@ -1,48 +1,37 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::Arc;
-use std::boxed::FnBox;
 use std::fmt::{self, Display, Formatter};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use kvproto::metapb;
+use kvproto::replication_modepb::ReplicationMode;
+use pd_client::{take_peer_address, PdClient};
+use raftstore::store::GlobalReplicationState;
+use tikv_util::collections::HashMap;
+use tikv_util::worker::{Runnable, Scheduler, Worker};
 
-use util::collections::HashMap;
-use util::worker::{Runnable, Scheduler, Worker};
-use pd::PdClient;
-
-use super::Result;
 use super::metrics::*;
+use super::Result;
 
 const STORE_ADDRESS_REFRESH_SECONDS: u64 = 60;
 
-pub type Callback = Box<FnBox(Result<String>) + Send>;
+pub type Callback = Box<dyn FnOnce(Result<String>) + Send>;
 
-// StoreAddrResolver resolves the store address.
+/// A trait for resolving store addresses.
 pub trait StoreAddrResolver: Send + Clone {
-    // Resolve resolves the store address asynchronously.
+    /// Resolves the address for the specified store id asynchronously.
     fn resolve(&self, store_id: u64, cb: Callback) -> Result<()>;
 }
 
-/// Snapshot generating task.
+/// A task for resolving store addresses.
 pub struct Task {
     store_id: u64,
     cb: Callback,
 }
 
 impl Display for Task {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "resolve store {} address", self.store_id)
     }
 }
@@ -52,9 +41,11 @@ struct StoreAddr {
     last_update: Instant,
 }
 
-pub struct Runner<T: PdClient> {
+/// A runner for resolving store addresses.
+struct Runner<T: PdClient> {
     pd_client: Arc<T>,
     store_addrs: HashMap<u64, StoreAddr>,
+    state: Arc<Mutex<GlobalReplicationState>>,
 }
 
 impl<T: PdClient> Runner<T> {
@@ -78,16 +69,27 @@ impl<T: PdClient> Runner<T> {
         Ok(addr)
     }
 
-    fn get_address(&mut self, store_id: u64) -> Result<String> {
-        let pd_client = self.pd_client.clone();
-        let s = box_try!(pd_client.get_store(store_id));
+    fn get_address(&self, store_id: u64) -> Result<String> {
+        let pd_client = Arc::clone(&self.pd_client);
+        let mut s = box_try!(pd_client.get_store(store_id));
+        let mut state = self.state.lock().unwrap();
+        let label_key = &state.status.get_dr_auto_sync().label_key;
+        if state.status.get_mode() == ReplicationMode::DrAutoSync {
+            if state.group.group_id(store_id).is_none() {
+                for l in s.get_labels() {
+                    if l.key == *label_key {
+                        state.group.register_store(store_id, l.value.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        drop(state);
         if s.get_state() == metapb::StoreState::Tombstone {
-            RESOLVE_STORE_COUNTER
-                .with_label_values(&["tombstone"])
-                .inc();
+            RESOLVE_STORE_COUNTER_STATIC.tombstone.inc();
             return Err(box_err!("store {} has been removed", store_id));
         }
-        let addr = s.get_address().to_owned();
+        let addr = take_peer_address(&mut s);
         // In some tests, we use empty address for store first,
         // so we should ignore here.
         // TODO: we may remove this check after we refactor the test.
@@ -102,10 +104,11 @@ impl<T: PdClient> Runnable<Task> for Runner<T> {
     fn run(&mut self, task: Task) {
         let store_id = task.store_id;
         let resp = self.resolve(store_id);
-        task.cb.call_box((resp,))
+        (task.cb)(resp)
     }
 }
 
+/// A store address resolver which is backed by a `PDClient`.
 #[derive(Clone)]
 pub struct PdStoreAddrResolver {
     sched: Scheduler<Task>,
@@ -113,33 +116,36 @@ pub struct PdStoreAddrResolver {
 
 impl PdStoreAddrResolver {
     pub fn new(sched: Scheduler<Task>) -> PdStoreAddrResolver {
-        PdStoreAddrResolver { sched: sched }
+        PdStoreAddrResolver { sched }
     }
 }
 
-pub fn new_resolver<T>(pd_client: Arc<T>) -> Result<(Worker<Task>, PdStoreAddrResolver)>
+/// Creates a new `PdStoreAddrResolver`.
+pub fn new_resolver<T>(
+    pd_client: Arc<T>,
+) -> Result<(
+    Worker<Task>,
+    PdStoreAddrResolver,
+    Arc<Mutex<GlobalReplicationState>>,
+)>
 where
     T: PdClient + 'static,
 {
-    let mut worker = Worker::new("store address resolve worker");
-
+    let mut worker = Worker::new("addr-resolver");
+    let state = Arc::new(Mutex::new(GlobalReplicationState::default()));
     let runner = Runner {
-        pd_client: pd_client,
+        pd_client,
         store_addrs: HashMap::default(),
+        state: state.clone(),
     };
     box_try!(worker.start(runner));
-    let resolver = PdStoreAddrResolver {
-        sched: worker.scheduler(),
-    };
-    Ok((worker, resolver))
+    let resolver = PdStoreAddrResolver::new(worker.scheduler());
+    Ok((worker, resolver, state))
 }
 
 impl StoreAddrResolver for PdStoreAddrResolver {
     fn resolve(&self, store_id: u64, cb: Callback) -> Result<()> {
-        let task = Task {
-            store_id: store_id,
-            cb: cb,
-        };
+        let task = Task { store_id, cb };
         box_try!(self.sched.schedule(task));
         Ok(())
     }
@@ -149,17 +155,15 @@ impl StoreAddrResolver for PdStoreAddrResolver {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
     use std::ops::Sub;
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::thread;
+    use std::time::{Duration, Instant};
 
-    use kvproto::pdpb;
     use kvproto::metapb;
-    use pd::{PdClient, PdFuture, RegionStat, Result};
-    use util;
-    use util::collections::HashMap;
+    use pd_client::{PdClient, Result};
+    use tikv_util::collections::HashMap;
 
     const STORE_ADDRESS_REFRESH_SECONDS: u64 = 60;
 
@@ -169,67 +173,18 @@ mod tests {
     }
 
     impl PdClient for MockPdClient {
-        fn get_cluster_id(&self) -> Result<u64> {
-            unimplemented!();
-        }
-        fn bootstrap_cluster(&self, _: metapb::Store, _: metapb::Region) -> Result<()> {
-            unimplemented!();
-        }
-        fn is_cluster_bootstrapped(&self) -> Result<bool> {
-            unimplemented!();
-        }
-        fn alloc_id(&self) -> Result<u64> {
-            unimplemented!();
-        }
-        fn put_store(&self, _: metapb::Store) -> Result<()> {
-            unimplemented!();
-        }
         fn get_store(&self, _: u64) -> Result<metapb::Store> {
             // The store address will be changed every millisecond.
             let mut store = self.store.clone();
             let mut sock = SocketAddr::from_str(store.get_address()).unwrap();
-            sock.set_port(util::time::duration_to_ms(self.start.elapsed()) as u16);
+            sock.set_port(tikv_util::time::duration_to_ms(self.start.elapsed()) as u16);
             store.set_address(format!("{}:{}", sock.ip(), sock.port()));
             Ok(store)
-        }
-        fn get_cluster_config(&self) -> Result<metapb::Cluster> {
-            unimplemented!();
-        }
-        fn get_region(&self, _: &[u8]) -> Result<metapb::Region> {
-            unimplemented!();
-        }
-        fn get_region_by_id(&self, _: u64) -> PdFuture<Option<metapb::Region>> {
-            unimplemented!();
-        }
-        fn region_heartbeat(
-            &self,
-            _: metapb::Region,
-            _: metapb::Peer,
-            _: RegionStat,
-        ) -> PdFuture<()> {
-            unimplemented!();
-        }
-
-        fn handle_region_heartbeat_response<F>(&self, _: u64, _: F) -> PdFuture<()>
-        where
-            F: Fn(pdpb::RegionHeartbeatResponse) + Send + 'static,
-        {
-            unimplemented!()
-        }
-
-        fn ask_split(&self, _: metapb::Region) -> PdFuture<pdpb::AskSplitResponse> {
-            unimplemented!();
-        }
-        fn store_heartbeat(&self, _: pdpb::StoreStats) -> PdFuture<()> {
-            unimplemented!();
-        }
-        fn report_split(&self, _: metapb::Region, _: metapb::Region) -> PdFuture<()> {
-            unimplemented!();
         }
     }
 
     fn new_store(addr: &str, state: metapb::StoreState) -> metapb::Store {
-        let mut store = metapb::Store::new();
+        let mut store = metapb::Store::default();
         store.set_id(1);
         store.set_state(state);
         store.set_address(addr.into());
@@ -239,35 +194,47 @@ mod tests {
     fn new_runner(store: metapb::Store) -> Runner<MockPdClient> {
         let client = MockPdClient {
             start: Instant::now(),
-            store: store,
+            store,
         };
         Runner {
             pd_client: Arc::new(client),
             store_addrs: HashMap::default(),
+            state: Default::default(),
         }
     }
 
-    const STORE_ADDR: &'static str = "127.0.0.1:12345";
+    const STORE_ADDR: &str = "127.0.0.1:12345";
 
     #[test]
     fn test_resolve_store_state_up() {
         let store = new_store(STORE_ADDR, metapb::StoreState::Up);
-        let mut runner = new_runner(store);
+        let runner = new_runner(store);
         assert!(runner.get_address(0).is_ok());
     }
 
     #[test]
     fn test_resolve_store_state_offline() {
         let store = new_store(STORE_ADDR, metapb::StoreState::Offline);
-        let mut runner = new_runner(store);
+        let runner = new_runner(store);
         assert!(runner.get_address(0).is_ok());
     }
 
     #[test]
     fn test_resolve_store_state_tombstone() {
         let store = new_store(STORE_ADDR, metapb::StoreState::Tombstone);
-        let mut runner = new_runner(store);
+        let runner = new_runner(store);
         assert!(runner.get_address(0).is_err());
+    }
+
+    #[test]
+    fn test_resolve_store_peer_addr() {
+        let mut store = new_store("127.0.0.1:12345", metapb::StoreState::Up);
+        store.set_peer_address("127.0.0.1:22345".to_string());
+        let runner = new_runner(store);
+        assert_eq!(
+            runner.get_address(0).unwrap(),
+            "127.0.0.1:22345".to_string()
+        );
     }
 
     #[test]

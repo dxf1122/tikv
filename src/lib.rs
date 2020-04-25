@@ -1,96 +1,95 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
+
+//! TiKV - A distributed key/value database
+//!
+//! TiKV ("Ti" stands for Titanium) is an open source distributed
+//! transactional key-value database. Unlike other traditional NoSQL
+//! systems, TiKV not only provides classical key-value APIs, but also
+//! transactional APIs with ACID compliance. TiKV was originally
+//! created to complement [TiDB], a distributed HTAP database
+//! compatible with the MySQL protocol.
+//!
+//! [TiDB]: https://github.com/pingcap/tidb
+//!
+//! The design of TiKV is inspired by some great distributed systems
+//! from Google, such as BigTable, Spanner, and Percolator, and some
+//! of the latest achievements in academia in recent years, such as
+//! the Raft consensus algorithm.
 
 #![crate_type = "lib"]
 #![cfg_attr(test, feature(test))]
-#![feature(fnbox)]
-#![feature(alloc)]
-#![feature(slice_patterns)]
-#![feature(box_syntax)]
-#![feature(iterator_for_each)]
-#![feature(conservative_impl_trait)]
-#![cfg_attr(feature = "dev", feature(plugin))]
-#![cfg_attr(feature = "dev", plugin(clippy))]
-#![cfg_attr(not(feature = "dev"), allow(unknown_lints))]
-#![recursion_limit = "100"]
-#![feature(ascii_ctype)]
-#![allow(module_inception)]
-#![allow(should_implement_trait)]
-#![allow(large_enum_variant)]
-#![allow(needless_pass_by_value)]
-#![allow(unreadable_literal)]
-#![allow(new_without_default_derive)]
-#![allow(verbose_bit_mask)]
+#![recursion_limit = "400"]
+#![feature(cell_update)]
+#![feature(proc_macro_hygiene)]
+#![feature(specialization)]
+#![feature(const_fn)]
+#![feature(box_patterns)]
+#![feature(shrink_to)]
+#![feature(drain_filter)]
+#![feature(str_strip)]
 
+#[macro_use(fail_point)]
+extern crate fail;
 #[macro_use]
-extern crate log;
+extern crate lazy_static;
 #[macro_use]
 extern crate quick_error;
 #[macro_use]
-extern crate bitflags;
+extern crate serde_derive;
+#[macro_use]
+extern crate slog_derive;
+#[macro_use]
+extern crate slog_global;
+#[macro_use]
+extern crate derive_more;
+#[macro_use]
+extern crate more_asserts;
+#[macro_use]
+extern crate vlog;
+#[macro_use]
+extern crate tikv_util;
+#[macro_use]
+extern crate failure;
+
 #[cfg(test)]
 extern crate test;
-extern crate protobuf;
-extern crate byteorder;
-extern crate rand;
-extern crate mio;
-extern crate tempdir;
-extern crate rocksdb;
-extern crate kvproto;
-extern crate time;
-extern crate tipb;
-extern crate libc;
-extern crate crc;
-extern crate alloc;
-extern crate chrono;
-extern crate zipf;
-#[macro_use]
-extern crate prometheus;
-#[macro_use]
-extern crate lazy_static;
-extern crate backtrace;
-extern crate url;
-extern crate fs2;
-extern crate regex;
-extern crate grpcio as grpc;
-extern crate fnv;
-extern crate flat_map;
-extern crate ordermap;
-extern crate futures;
-extern crate futures_cpupool;
-extern crate tokio_core;
-extern crate tokio_timer;
-extern crate serde_json;
-extern crate serde;
-extern crate murmur3;
-#[macro_use]
-extern crate serde_derive;
-#[cfg(test)]
-extern crate toml;
-extern crate sys_info;
-#[cfg(test)]
-extern crate utime;
-#[macro_use]
-extern crate fail;
 
-#[macro_use]
-pub mod util;
+extern crate encryption;
+
 pub mod config;
-pub mod raft;
-pub mod storage;
-pub mod raftstore;
-pub mod pd;
-pub mod server;
 pub mod coprocessor;
+pub mod import;
+pub mod read_pool;
+pub mod server;
+pub mod storage;
 
-pub use storage::Storage;
+/// Returns the tikv version information.
+pub fn tikv_version_info() -> String {
+    let fallback = "Unknown (env var does not exist when building)";
+    format!(
+        "\nRelease Version:   {}\
+         \nGit Commit Hash:   {}\
+         \nGit Commit Branch: {}\
+         \nUTC Build Time:    {}\
+         \nRust Version:      {}\
+         \nEnable Features:   {}\
+         \nProfile:           {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("TIKV_BUILD_GIT_HASH").unwrap_or(fallback),
+        option_env!("TIKV_BUILD_GIT_BRANCH").unwrap_or(fallback),
+        option_env!("TIKV_BUILD_TIME").unwrap_or(fallback),
+        option_env!("TIKV_BUILD_RUSTC_VERSION").unwrap_or(fallback),
+        option_env!("TIKV_ENABLE_FEATURES")
+            .unwrap_or(fallback)
+            .trim(),
+        option_env!("TIKV_PROFILE").unwrap_or(fallback),
+    )
+}
+
+/// Prints the tikv version information to the standard output.
+pub fn log_tikv_info() {
+    info!("Welcome to TiKV");
+    for line in tikv_version_info().lines() {
+        info!("{}", line);
+    }
+}

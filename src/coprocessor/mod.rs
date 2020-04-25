@@ -1,89 +1,173 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
+//! Handles simple SQL query executors locally.
+//!
+//! Most TiDB read queries are processed by Coprocessor instead of KV interface.
+//! By doing so, the CPU of TiKV nodes can be utilized for computing and the
+//! amount of data to transfer can be reduced (i.e. filtered at TiKV side).
+//!
+//! Notice that Coprocessor handles more than simple SQL query executors (DAG request). It also
+//! handles analyzing requests and checksum requests.
+//!
+//! The entry point of handling all coprocessor requests is `Endpoint`. Common steps are:
+//! 1. Parse the request into a DAG request, Checksum request or Analyze request.
+//! 2. Retrieve a snapshot from the underlying engine according to the given timestamp.
+//! 3. Build corresponding request handlers from the snapshot and request detail.
+//! 4. Run request handlers once (for unary requests) or multiple times (for streaming requests)
+//!    on a future thread pool.
+//! 5. Return handling result as a response.
+//!
+//! Please refer to `Endpoint` for more details.
+
+mod cache;
+mod checksum;
+pub mod dag;
 mod endpoint;
-mod metrics;
-mod local_metrics;
-mod dag;
+mod error;
+mod interceptors;
+pub(crate) mod metrics;
+pub mod readpool_impl;
 mod statistics;
-pub mod codec;
+mod tracker;
 
-use std::result;
-use std::error;
+pub use self::endpoint::Endpoint;
+pub use self::error::{Error, Result};
+pub use checksum::checksum_crc64_xor;
 
-use kvproto::kvrpcpb::LockInfo;
-use kvproto::errorpb;
+use crate::storage::Statistics;
+use async_trait::async_trait;
+use kvproto::{coprocessor as coppb, kvrpcpb};
+use metrics::ReqTag;
+use tikv_util::deadline::Deadline;
+use tikv_util::time::Duration;
+use txn_types::TsSet;
 
-use storage::{engine, mvcc, txn};
-use util::time::Instant;
+pub const REQ_TYPE_DAG: i64 = 103;
+pub const REQ_TYPE_ANALYZE: i64 = 104;
+pub const REQ_TYPE_CHECKSUM: i64 = 105;
 
-quick_error! {
-    #[derive(Debug)]
-    pub enum Error {
-        Region(err: errorpb::Error) {
-            description("region related failure")
-            display("region {:?}", err)
-        }
-        Locked(l: LockInfo) {
-            description("key is locked")
-            display("locked {:?}", l)
-        }
-        Outdated(deadline: Instant, now: Instant, tag: &'static str) {
-            description("request is outdated")
-        }
-        Full(allow: usize) {
-            description("running queue is full")
-        }
-        Other(err: Box<error::Error + Send + Sync>) {
-            from()
-            cause(err.as_ref())
-            description(err.description())
-            display("unknown error {:?}", err)
-        }
+type HandlerStreamStepResult = Result<(Option<coppb::Response>, bool)>;
+
+/// An interface for all kind of Coprocessor request handlers.
+#[async_trait]
+pub trait RequestHandler: Send {
+    /// Processes current request and produces a response.
+    async fn handle_request(&mut self) -> Result<coppb::Response> {
+        panic!("unary request is not supported for this handler");
+    }
+
+    /// Processes current request and produces streaming responses.
+    fn handle_streaming_request(&mut self) -> HandlerStreamStepResult {
+        panic!("streaming request is not supported for this handler");
+    }
+
+    /// Collects scan statistics generated in this request handler so far.
+    fn collect_scan_statistics(&mut self, _dest: &mut Statistics) {
+        // Do nothing by default
+    }
+
+    fn into_boxed(self) -> Box<dyn RequestHandler>
+    where
+        Self: 'static + Sized,
+    {
+        Box::new(self)
     }
 }
 
-pub type Result<T> = result::Result<T, Error>;
+type RequestHandlerBuilder<Snap> =
+    Box<dyn for<'a> FnOnce(Snap, &'a ReqContext) -> Result<Box<dyn RequestHandler>> + Send>;
 
-impl From<engine::Error> for Error {
-    fn from(e: engine::Error) -> Error {
-        match e {
-            engine::Error::Request(e) => Error::Region(e),
-            _ => Error::Other(box e),
-        }
-    }
+/// Encapsulate the `kvrpcpb::Context` to provide some extra properties.
+#[derive(Debug, Clone)]
+pub struct ReqContext {
+    /// The tag of the request
+    pub tag: ReqTag,
+
+    /// The rpc context carried in the request
+    pub context: kvrpcpb::Context,
+
+    /// The first range of the request
+    pub first_range: Option<coppb::KeyRange>,
+
+    /// The length of the range
+    pub ranges_len: usize,
+
+    /// The deadline of the request
+    pub deadline: Deadline,
+
+    /// The peer address of the request
+    pub peer: Option<String>,
+
+    /// Whether the request is a descending scan (only applicable to DAG)
+    pub is_desc_scan: Option<bool>,
+
+    /// The transaction start_ts of the request
+    pub txn_start_ts: Option<u64>,
+
+    /// The set of timestamps of locks that can be bypassed during the reading.
+    pub bypass_locks: TsSet,
+
+    /// The data version to match. If it matches the underlying data version,
+    /// request will not be processed (i.e. cache hit).
+    ///
+    /// None means don't try to hit the cache.
+    pub cache_match_version: Option<u64>,
+
+    /// The lower bound key in ranges of the request
+    pub lower_bound: Vec<u8>,
+
+    /// The upper bound key in ranges of the request
+    pub upper_bound: Vec<u8>,
 }
 
-impl From<txn::Error> for Error {
-    fn from(e: txn::Error) -> Error {
-        match e {
-            txn::Error::Mvcc(mvcc::Error::KeyIsLocked {
-                primary,
-                ts,
-                key,
-                ttl,
-            }) => {
-                let mut info = LockInfo::new();
-                info.set_primary_lock(primary);
-                info.set_lock_version(ts);
-                info.set_key(key);
-                info.set_lock_ttl(ttl);
-                Error::Locked(info)
-            }
-            _ => Error::Other(box e),
+impl ReqContext {
+    pub fn new(
+        tag: ReqTag,
+        mut context: kvrpcpb::Context,
+        ranges: &[coppb::KeyRange],
+        max_handle_duration: Duration,
+        peer: Option<String>,
+        is_desc_scan: Option<bool>,
+        txn_start_ts: Option<u64>,
+        cache_match_version: Option<u64>,
+    ) -> Self {
+        let deadline = Deadline::from_now(max_handle_duration);
+        let bypass_locks = TsSet::from_u64s(context.take_resolved_locks());
+        let lower_bound = match ranges.first().as_ref() {
+            Some(range) => range.start.clone(),
+            None => vec![],
+        };
+        let upper_bound = match ranges.last().as_ref() {
+            Some(range) => range.end.clone(),
+            None => vec![],
+        };
+        Self {
+            tag,
+            context,
+            deadline,
+            peer,
+            is_desc_scan,
+            txn_start_ts,
+            first_range: ranges.first().cloned(),
+            ranges_len: ranges.len(),
+            bypass_locks,
+            cache_match_version,
+            lower_bound,
+            upper_bound,
         }
     }
-}
 
-pub use self::endpoint::{CopRequestStatistics, CopSender, Host as EndPointHost, RequestTask,
-                         Task as EndPointTask, REQ_TYPE_DAG, SINGLE_GROUP};
+    #[cfg(test)]
+    pub fn default_for_test() -> Self {
+        Self::new(
+            ReqTag::test,
+            kvrpcpb::Context::default(),
+            &[],
+            Duration::from_secs(100),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+}
